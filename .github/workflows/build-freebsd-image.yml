@@ -1,0 +1,179 @@
+name: Build & Publish FreeBSD Cloud Image
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # Every Sunday at 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-freebsd:
+    name: Build FreeBSD 15.1 Cinc Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify KVM Availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "KVM acceleration is available."
+            sudo chmod 666 /dev/kvm
+          else
+            echo "ERROR: /dev/kvm is not available." >&2
+            exit 1
+          fi
+
+      - name: Install QEMU, OVMF, and Build Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage ovmf xz-utils curl
+
+      - name: Download Official FreeBSD 15 Image
+        run: |
+          IMAGE_URL="https://download.freebsd.org/ftp/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz"
+          echo "Downloading FreeBSD image from ${IMAGE_URL}..."
+          curl -fSL -o freebsd-upstream.qcow2.xz "${IMAGE_URL}"
+          echo "Decompressing image..."
+          xz -d -v freebsd-upstream.qcow2.xz
+          mv freebsd-upstream.qcow2 freebsd-base.qcow2
+          qemu-img resize freebsd-base.qcow2 +10G
+
+      - name: Generate Ephemeral SSH Key and CI Data Seed ISO
+        run: |
+          ssh-keygen -t ed25519 -N "" -f id_builder
+          PUBKEY=$(cat id_builder.pub)
+
+          cat << EOF > user-data
+          #cloud-config
+          users:
+            - name: builder
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              groups: [wheel]
+              lock_passwd: true
+              ssh_authorized_keys:
+                - ${PUBKEY}
+          EOF
+
+          cat << 'EOF' > meta-data
+          instance-id: build-freebsd-15
+          local-hostname: build-freebsd-15
+          EOF
+
+          genisoimage -output cidata.iso -volid cidata -joliet -rock user-data meta-data
+
+      - name: Boot QEMU and Provision FreeBSD Guest
+        run: |
+          # Detect OVMF firmware path
+          OVMF_PATH=""
+          if [ -f /usr/share/ovmf/OVMF.fd ]; then
+            OVMF_PATH="/usr/share/ovmf/OVMF.fd"
+          elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
+            OVMF_PATH="/usr/share/OVMF/OVMF_CODE.fd"
+          else
+            echo "OVMF firmware not found!" >&2
+            exit 1
+          fi
+          echo "Using OVMF firmware at ${OVMF_PATH}"
+
+          # Start QEMU with KVM
+          qemu-system-x86_64 \
+            -m 2048 \
+            -smp 2 \
+            -cpu host \
+            -enable-kvm \
+            -machine q35 \
+            -bios "${OVMF_PATH}" \
+            -drive file=freebsd-base.qcow2,if=virtio,format=qcow2 \
+            -drive file=cidata.iso,if=virtio,media=cdrom \
+            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -daemonize \
+            -pidfile qemu.pid
+
+          # Wait for SSH to answer
+          echo "Waiting for FreeBSD VM to complete initial boot and start SSH..."
+          TIMEOUT=300
+          ELAPSED=0
+          until ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 -p 2222 -i id_builder builder@127.0.0.1 "true" 2>/dev/null; do
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "Timeout waiting for FreeBSD SSH!" >&2
+              kill $(cat qemu.pid) || true
+              exit 1
+            fi
+          done
+          echo "SSH connection established in ${ELAPSED} seconds."
+
+          # Execute provisioning inside the guest
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 -i id_builder builder@127.0.0.1 << 'EOF'
+          set -eux
+
+          echo "=== Step 1: Upgrading base system and ports ==="
+          sudo pkg update
+          sudo pkg upgrade -y
+          sudo pkg install -y sudo curl
+
+          echo "=== Step 2: Installing Cinc Client ==="
+          curl -L https://omnitruck.cinc.sh/install.sh | sudo sh
+
+          echo "=== Step 3: Cleaning up build artifacts and re-arming firstboot ==="
+          # Clean package cache
+          sudo pkg clean -y -a
+          # Re-arm firstboot so nuageinit and firstboot scripts run on the consumer's VM
+          sudo touch /firstboot
+          # Remove builder user and ephemeral keys
+          sudo rm -rf /home/builder/.ssh
+          sudo pw userdel builder -r -y || true
+          # Clean machine-specific identifiers and logs
+          sudo rm -rf /tmp/* /var/tmp/* /var/log/*.log /var/log/messages* /var/log/nuageinit.log /etc/rc.conf.d/*
+
+          echo "=== Step 4: Gracefully shutting down guest ==="
+          sudo sync
+          sudo poweroff
+          EOF
+
+          # Wait for QEMU process to terminate
+          echo "Waiting for QEMU VM shutdown..."
+          while kill -0 $(cat qemu.pid) 2>/dev/null; do
+            sleep 2
+          done
+          echo "QEMU VM terminated cleanly."
+
+      - name: Compress and Hash Custom Image
+        run: |
+          DATE=$(date +%Y%m%d)
+          IMAGE_NAME="freebsd-15.1-cinc-amd64-${DATE}.qcow2"
+          
+          echo "Compacting qcow2 disk image..."
+          qemu-img convert -O qcow2 -c freebsd-base.qcow2 "${IMAGE_NAME}"
+
+          echo "Compressing with xz (multi-threaded)..."
+          xz -9 -T0 -v "${IMAGE_NAME}"
+          
+          sha256sum "${IMAGE_NAME}.xz" > "${IMAGE_NAME}.xz.sha256"
+
+          # Create a fixed symlink/copy for the latest release asset
+          cp "${IMAGE_NAME}.xz" freebsd-15.1-cinc-amd64-latest.qcow2.xz
+          sha256sum freebsd-15.1-cinc-amd64-latest.qcow2.xz > freebsd-15.1-cinc-amd64-latest.qcow2.xz.sha256
+
+          echo "RELEASE_TAG=v15.1-cinc-${DATE}" >> $GITHUB_ENV
+          echo "IMAGE_FILE=${IMAGE_NAME}.xz" >> $GITHUB_ENV
+          echo "IMAGE_SHA=${IMAGE_NAME}.xz.sha256" >> $GITHUB_ENV
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "FreeBSD 15.1 with Cinc Client (${{ env.RELEASE_TAG }})"
+          make_latest: true
+          files: |
+            ${{ env.IMAGE_FILE }}
+            ${{ env.IMAGE_SHA }}
+            freebsd-15.1-cinc-amd64-latest.qcow2.xz
+            freebsd-15.1-cinc-amd64-latest.qcow2.xz.sha256
