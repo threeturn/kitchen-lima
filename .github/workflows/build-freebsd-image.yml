@@ -141,6 +141,9 @@ jobs:
           sudo pw userdel builder -r -y || true
           # Clean machine-specific identifiers and logs
           sudo rm -rf /tmp/* /var/tmp/* /var/log/*.log /var/log/messages* /var/log/nuageinit.log /etc/rc.conf.d/*
+          # Zero out deleted disk blocks so qemu-img and xz compress them efficiently
+          sudo dd if=/dev/zero of=/var/tmp/zero.fill bs=1M status=none || true
+          sudo rm -f /var/tmp/zero.fill
 
           echo "=== Step 4: Gracefully shutting down guest ==="
           sudo sync
@@ -160,7 +163,7 @@ jobs:
           IMAGE_NAME="freebsd-15.1-cinc-amd64-${DATE}.qcow2"
           
           echo "Compacting qcow2 disk image..."
-          qemu-img convert -O qcow2 -c freebsd-base.qcow2 "${IMAGE_NAME}"
+          qemu-img convert -O qcow2 freebsd-base.qcow2 "${IMAGE_NAME}"
 
           echo "Compressing with xz (multi-threaded)..."
           xz -9 -T0 -v "${IMAGE_NAME}"
