@@ -2,6 +2,6 @@
 
 module Kitchen
   module Driver
-    LIMA_VERSION = "0.1.0"
+    LIMA_VERSION = "0.2.0"
   end
 end

@@ -19,25 +19,36 @@ module Kitchen
       default_config :memory, 2 # in GiB
       default_config :vm_type, "qemu"
       default_config :disk, nil
+      default_config :set, []
+      default_config :lima_config, {}
 
       def create(state)
         return if state[:lima_instance]
 
         vm_name = "tk-#{instance.name}".downcase.gsub(/[^a-z0-9_-]/, "-")
-        raw_tpl = config[:template].to_s.sub(/^template:/, "")
-
-        tpl_name = resolve_template_name(raw_tpl)
-        tpl = "template:#{tpl_name}"
+        tpl = resolve_template(config[:template].to_s)
 
         cmd = ["limactl", "start", "--name=#{vm_name}", "--vm-type=#{config[:vm_type]}"]
         cmd << "--cpus=#{config[:cpus]}" if config[:cpus]
         cmd << "--memory=#{config[:memory]}" if config[:memory]
         cmd << "--disk=#{config[:disk]}" if config[:disk]
+
+        # Support explicit 'set' expressions (yq syntax)
+        Array(config[:set]).each do |expr|
+          cmd << "--set=#{expr}"
+        end
+
+        # Support structured 'lima_config' hash
+        config[:lima_config]&.each do |key, value|
+          formatted_val = format_yaml_scalar(value)
+          cmd << "--set=.#{key} = #{formatted_val}"
+        end
+
         cmd << "--tty=false"
         cmd << tpl
 
         info("Creating Lima VM '#{vm_name}' from #{tpl} using #{config[:vm_type]}...")
-        run_cmd(cmd.join(" "))
+        run_cmd(cmd)
 
         ssh_config_path = File.expand_path("~/.lima/#{vm_name}/ssh.config")
         raise ActionFailed, "Lima SSH config not found at #{ssh_config_path}" unless File.exist?(ssh_config_path)
@@ -53,7 +64,7 @@ module Kitchen
       def destroy(state)
         vm_name = state[:lima_instance] || "tk-#{instance.name}".downcase.gsub(/[^a-z0-9_-]/, "-")
         info("Destroying Lima VM '#{vm_name}'...")
-        system("limactl delete --force #{vm_name} >/dev/null 2>&1")
+        system("limactl", "delete", "--force", vm_name, out: File::NULL, err: File::NULL)
         state.delete(:lima_instance)
         state.delete(:hostname)
         state.delete(:port)
@@ -62,6 +73,19 @@ module Kitchen
       end
 
       private
+
+      def resolve_template(raw)
+        return raw if raw.start_with?("http://", "https://")
+        return raw if raw.start_with?("template:")
+
+        # Check if raw points to an existing file on the host (relative or absolute)
+        expanded = File.expand_path(raw)
+        return expanded if File.file?(expanded)
+
+        raw_clean = raw.sub(/^template:/, "")
+        tpl_name = resolve_template_name(raw_clean)
+        "template:#{tpl_name}"
+      end
 
       def resolve_template_name(raw)
         case raw
@@ -86,8 +110,26 @@ module Kitchen
         end
       end
 
+      def format_yaml_scalar(value)
+        case value
+        when TrueClass, FalseClass, Integer, Float
+          value.to_s
+        when NilClass
+          "null"
+        when Array, Hash
+          JSON.generate(value)
+        else
+          "\"#{value}\""
+        end
+      end
+
       def run_cmd(cmd)
-        system(cmd) || raise(ActionFailed, "Lima command failed: #{cmd}")
+        res = if cmd.is_a?(Array)
+                system(*cmd)
+              else
+                system(cmd)
+              end
+        res || raise(ActionFailed, "Lima command failed: #{Array(cmd).join(' ')}")
       end
     end
   end

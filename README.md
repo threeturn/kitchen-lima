@@ -11,6 +11,7 @@ Replaces Vagrant and VirtualBox with lightweight, fast, native virtualization po
 - **Official Cloud Images**: Uses unmodified upstream cloud images (`.qcow2`, `.raw.xz`, `.iso`) without needing specialized Vagrant boxes.
 - **Fast Local Caching**: Images are cached locally in `~/Library/Caches/lima/download/`, spinning up new instances in seconds.
 - **Automatic SSH Configuration**: Reads SSH ports and auto-generated keys directly from `limactl`.
+- **Full Lima Customization**: Pass arbitrary `limactl --set` expressions, structured configuration hashes, or custom template YAML files.
 
 ## Prerequisites
 
@@ -64,6 +65,8 @@ platforms:
   - name: freebsd-15.1
     driver:
       template: freebsd-15
+      set:
+        - ".upgradePackages = false"
   - name: ubuntu-24.04
 
 suites:
@@ -77,11 +80,13 @@ suites:
 
 | Key | Default | Description |
 |---|---|---|
-| `template` | `instance.platform.name` | Lima template name (e.g. `almalinux-9`, `freebsd-15`, `ubuntu-24.04`) |
+| `template` | `instance.platform.name` | Lima template name (`almalinux-9`, `freebsd-15`, etc.), local file path (`./my-template.yaml`), or URL |
 | `vm_type` | `qemu` | VM hypervisor driver (`qemu` or `vz`) |
 | `cpus` | `2` | Number of virtual CPU cores |
 | `memory` | `2` | RAM allocated to the VM (in GiB) |
 | `disk` | `nil` | Disk size allocated to the VM (e.g. `20` in GiB) |
+| `set` | `[]` | Array of `yq` expressions passed as `--set` to `limactl start` (e.g. `[".upgradePackages = false"]`) |
+| `lima_config` | `{}` | Hash of Lima settings converted to `--set` flags (e.g. `{ upgradePackages: false }`) |
 
 ## License
 
