@@ -49,10 +49,19 @@ jobs:
 
           cat << EOF > user-data
           #cloud-config
+          growpart:
+            mode: auto
+            devices: ['/']
+          packages:
+            - sudo
           users:
             - name: builder
+              homedir: /home/builder
+              shell: /bin/sh
               sudo: ALL=(ALL) NOPASSWD:ALL
-              groups: [wheel]
+              groups:
+                - wheel
+              doas: permit nopass :wheel
               lock_passwd: true
               ssh_authorized_keys:
                 - ${PUBKEY}
